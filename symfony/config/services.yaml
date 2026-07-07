@@ -3,6 +3,11 @@
 # on the Media clients). This file is intentionally minimal.
 
 parameters:
+    # Timeout (seconds) for the heavy Radarr/Sonarr full-library endpoints
+    # (/api/v3/movie, /api/v3/series). These can take 10s+ on large homelibs,
+    # so they need their own ceiling well above the 8s used for normal calls.
+    # Override with the ARR_LIBRARY_TIMEOUT environment variable.
+    env(ARR_LIBRARY_TIMEOUT): 20
 
 services:
     _defaults:
