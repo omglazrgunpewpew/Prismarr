@@ -1,0 +1,6 @@
+docker/frankenphp/**/*.sh text eol=lf
+docker/frankenphp/**/run text eol=lf
+docker/frankenphp/**/type text eol=lf
+docker/frankenphp/**/up text eol=lf
+docker/frankenphp/**/contents.d/* text eol=lf
+docker/frankenphp/**/dependencies.d/* text eol=lf
