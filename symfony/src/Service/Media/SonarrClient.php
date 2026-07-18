@@ -6,6 +6,7 @@ use App\Entity\ServiceInstance;
 use App\Exception\ServiceNotConfiguredException;
 use App\Service\ServiceInstanceProvider;
 use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Contracts\Service\ResetInterface;
 
 class SonarrClient implements ResetInterface
@@ -32,6 +33,8 @@ class SonarrClient implements ResetInterface
         private readonly ServiceInstanceProvider $instances,
         private readonly LoggerInterface $logger,
         private readonly ServiceHealthCache $health,
+        #[Autowire(env: 'int:ARR_LIBRARY_TIMEOUT')]
+        private readonly int $libraryTimeout = 20,
     ) {}
 
     /**
@@ -198,7 +201,7 @@ class SonarrClient implements ResetInterface
 
     public function getSeries(): array
     {
-        $data = $this->get('/api/v3/series');
+        $data = $this->get('/api/v3/series', [], $this->libraryTimeout);
         if ($data === null) return [];
 
         return $this->normalizeSeriesList($data);
@@ -219,7 +222,7 @@ class SonarrClient implements ResetInterface
     /** Returns raw series without normalization (for lightweight cache) */
     public function getRawAllSeries(): array
     {
-        return $this->get('/api/v3/series') ?? [];
+        return $this->get('/api/v3/series', [], $this->libraryTimeout) ?? [];
     }
 
     public function getSerie(int $id): ?array

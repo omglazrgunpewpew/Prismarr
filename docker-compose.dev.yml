@@ -12,3 +12,9 @@ services:
       - PHP_MAX_EXECUTION_TIME=240
     volumes:
       - ./symfony:/var/www/html
+      # Keep the regenerable cache/log dirs OFF the bind mount: on a Windows
+      # host the bind mount is a slow gRPC-FUSE/virtiofs share, and init.sh's
+      # `chown -R var/` would crawl thousands of cache files for minutes at
+      # boot. Container-local volumes make boot fast and speed up the app.
+      - /var/www/html/var/cache
+      - /var/www/html/var/log

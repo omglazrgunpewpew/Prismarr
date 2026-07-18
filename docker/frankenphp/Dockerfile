@@ -77,10 +77,14 @@ RUN chmod 0644 /etc/caddy/Caddyfile && \
 
 # ── s6 services ─────────────────────────────────────────────────────────
 COPY docker/frankenphp/s6/ /etc/s6-overlay/s6-rc.d/
+# s6 refuses to execute scripts with CRLF line endings, and a Windows/OneDrive
+# checkout can reintroduce CRLF despite .gitattributes. Normalize at build time
+# so the image is correct regardless of the host's checkout settings.
+RUN find /etc/s6-overlay/s6-rc.d/ -type f -exec sed -i 's/\r$//' {} +
 
 # ── Init script (secret generation + DB schema) ─────────────────────────
 COPY docker/frankenphp/init.sh /usr/local/bin/prismarr-init
-RUN chmod +x /usr/local/bin/prismarr-init
+RUN sed -i 's/\r$//' /usr/local/bin/prismarr-init && chmod +x /usr/local/bin/prismarr-init
 
 # ── Symfony code ────────────────────────────────────────────────────────
 WORKDIR /var/www/html
