@@ -2,6 +2,12 @@
 {% import '_icons.html.twig' as ico %}
 {% block title %}{{ 'qbittorrent.page_title'|trans }}{% endblock %}
 {% block page_title %}<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2f67ba" stroke-width="2"><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/><path d="M7 11l5 5 5-5"/><path d="M12 4v12"/></svg> {{ 'qbittorrent.page_title'|trans }}{% endblock %}
+{# Always a full reload in/out of this page — its 3s poller uses a
+   window-global timer handle shared with the other torrent client pages
+   (qBittorrent/Deluge/Transmission); a Turbo in-place visit can leave the
+   outgoing page's closure (and its live interval) running, overwriting
+   the DOM with stale data. Full reload sidesteps the whole class of bug. #}
+{% block head_meta %}<meta name="turbo-visit-control" content="reload">{% endblock %}
 
 {% block stylesheets %}
 <style>
@@ -865,7 +871,6 @@ body[data-bs-theme="dark"] .qbt-torrent-list[data-view="table"] .qbt-cell-progre
 (function(){
     var BASE = '{{ path("app_qbittorrent_index") }}';
     var LOCALE = {{ app.request.locale|default('fr')|json_encode|raw }};
-    var refreshTimer = null;
     var currentFilter = 'all';
     var selectedHashes = {};
     var deleteTarget = { hashes: [], mode: 'single' };
@@ -1191,13 +1196,28 @@ body[data-bs-theme="dark"] .qbt-torrent-list[data-view="table"] .qbt-cell-progre
     // ── Refresh temps réel ──────────────────────────────────────────────────
     var REFRESH_INTERVAL = 3000; // 3s — compromis entre fluidité et charge qBit
 
+    // Le handle du timer vit sur window et NON dans cette closure : Turbo Drive
+    // ré-exécute le script de la page entrante avec une closure neuve, tandis que
+    // celle de la page sortante survit, son setInterval toujours vivant. Les trois
+    // pages de clients torrent (qBittorrent, Deluge, Transmission) partagent ce
+    // nom — une seule est montée à la fois — et rendent les MÊMES ids d'éléments :
+    // sans ce global, le poller orphelin de la page sortante continuerait d'écrire
+    // ses torrents par-dessus ceux de la page entrante. base.html.twig le purge
+    // aussi sur turbo:before-render, pour la navigation vers une page non-torrent.
+    function clearPollTimer() {
+        if (window._prismarrTorrentPagePollTimer) {
+            clearInterval(window._prismarrTorrentPagePollTimer);
+            window._prismarrTorrentPagePollTimer = null;
+        }
+    }
+
     function startRefresh() {
-        if (refreshTimer) clearInterval(refreshTimer);
+        clearPollTimer();
         if (document.hidden) return;  // pas de poll si onglet masqué
-        refreshTimer = setInterval(refreshData, REFRESH_INTERVAL);
+        window._prismarrTorrentPagePollTimer = setInterval(refreshData, REFRESH_INTERVAL);
     }
     function stopRefresh() {
-        if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+        clearPollTimer();
         if (refreshCtrl) { refreshCtrl.abort(); refreshCtrl = null; }
     }
 
@@ -1212,10 +1232,17 @@ body[data-bs-theme="dark"] .qbt-torrent-list[data-view="table"] .qbt-cell-progre
     });
 
     var refreshCtrl = null;
+    var refreshSeq = 0;
     function refreshData() {
         // Annule le fetch précédent s'il est encore en vol (évite empilement)
         if (refreshCtrl) refreshCtrl.abort();
         refreshCtrl = new AbortController();
+        // abort() n'a aucun effet si la réponse précédente est déjà arrivée
+        // (fréquent en local, où le round-trip peut être plus rapide que le
+        // délai clic → exécution JS) : sans ce numéro de séquence, une réponse
+        // de sondage périodique pour l'ancienne page peut s'appliquer APRÈS
+        // celle du clic sur une autre page, et y revenir juste après l'affichage.
+        var seq = ++refreshSeq;
         var q = new URLSearchParams({
             page: pagState.page,
             perPage: pagState.perPage,
@@ -1229,6 +1256,7 @@ body[data-bs-theme="dark"] .qbt-torrent-list[data-view="table"] .qbt-cell-progre
         fetch(BASE + '/api/torrents?' + q, { signal: refreshCtrl.signal, headers: { 'X-Requested-With': 'XMLHttpRequest' } })
         .then(function(r) { return r.json(); })
         .then(function(data) {
+            if (seq !== refreshSeq) return; // une requête plus récente a déjà été émise
             if (data.error) return;
             updateStats(data.stats);
             updateList(data.torrents);

@@ -63,6 +63,7 @@ class DashboardController extends AbstractController
         private readonly TranslatorInterface $translator,
         private readonly CacheInterface $cache,
         private readonly TautulliClient $tautulli,
+        private readonly \App\Service\DashboardLayoutService $layout,
     ) {}
 
     /**
@@ -161,6 +162,7 @@ class DashboardController extends AbstractController
         return $this->render('dashboard/index.html.twig', [
             'watchlist'           => $this->watchlist(),
             'services_configured' => $configured,
+            'dashboard_layout'    => $this->layout->resolve(),
         ]);
     }
 
@@ -505,6 +507,89 @@ class DashboardController extends AbstractController
     }
 
     /**
+     * Build the ordered release-date chips for a movie quick-look. Fixed
+     * semantic order cinema→digital→physical; nulls skipped; each chip flags
+     * whether the date is today-or-later (so the template can emphasize the
+     * next upcoming event). @return list<array{kind:string,label:string,date:\DateTimeImmutable,upcoming:bool}>
+     */
+    private function movieReleaseChips(?\DateTimeImmutable $cinema, ?\DateTimeImmutable $digital, ?\DateTimeImmutable $physical, \DateTimeImmutable $today): array
+    {
+        $defs = [
+            ['kind' => 'cinema',   'at' => $cinema,   'key' => 'dashboard.quicklook.date.cinema'],
+            ['kind' => 'digital',  'at' => $digital,  'key' => 'dashboard.quicklook.date.digital'],
+            ['kind' => 'physical', 'at' => $physical, 'key' => 'dashboard.quicklook.date.physical'],
+        ];
+        $chips = [];
+        foreach ($defs as $d) {
+            if (!$d['at'] instanceof \DateTimeImmutable) continue;
+            $chips[] = [
+                'kind'     => $d['kind'],
+                'label'    => $this->translator->trans($d['key']),
+                'date'     => $d['at'],
+                'upcoming' => $d['at']->setTime(0, 0) >= $today,
+            ];
+        }
+        return $chips;
+    }
+
+    /**
+     * Extract cinema/digital/physical dates from TMDb's release_dates append,
+     * preferring FR then US then the first country that has each type. TMDb
+     * type codes: 2/3 = theatrical, 4 = digital, 5 = physical.
+     * @return list<array{kind:string,label:string,date:\DateTimeImmutable,upcoming:bool}>
+     */
+    private function tmdbMovieReleaseDates(array $results, \DateTimeImmutable $today): array
+    {
+        $byCountry = [];
+        foreach ($results as $r) {
+            $cc = $r['iso_3166_1'] ?? '';
+            foreach ($r['release_dates'] ?? [] as $rd) {
+                $byCountry[$cc][(int) ($rd['type'] ?? 0)] = $rd['release_date'] ?? null;
+            }
+        }
+        $order = ['FR', 'US'];
+        foreach (array_keys($byCountry) as $cc) {
+            if (!in_array($cc, $order, true)) $order[] = $cc;
+        }
+        $pick = function (array $types) use ($byCountry, $order): ?\DateTimeImmutable {
+            foreach ($order as $cc) {
+                foreach ($types as $t) {
+                    $raw = $byCountry[$cc][$t] ?? null;
+                    if ($raw) return new \DateTimeImmutable($raw);
+                }
+            }
+            return null;
+        };
+        return $this->movieReleaseChips($pick([3, 2]), $pick([4]), $pick([5]), $today);
+    }
+
+    /**
+     * Air-date chips for a series quick-look: first-aired (if known), then
+     * either the next upcoming episode (continuing) or the last-aired date
+     * (ended). @return list<array{kind:string,label:string,date:\DateTimeImmutable,upcoming:bool}>
+     */
+    private function seriesReleaseChips(?\DateTimeImmutable $firstAired, ?\DateTimeImmutable $nextEpisode, ?\DateTimeImmutable $lastEpisode, bool $ended, \DateTimeImmutable $today): array
+    {
+        $chip = fn(string $kind, string $key, \DateTimeImmutable $d): array => [
+            'kind' => $kind, 'label' => $this->translator->trans($key),
+            'date' => $d, 'upcoming' => $d->setTime(0, 0) >= $today,
+        ];
+        $chips = [];
+        if ($firstAired) $chips[] = $chip('first_aired', 'dashboard.quicklook.date.first_aired', $firstAired);
+        if (!$ended && $nextEpisode) {
+            $chips[] = $chip('next_episode', 'dashboard.quicklook.date.next_episode', $nextEpisode);
+        } elseif ($ended && $lastEpisode) {
+            $chips[] = $chip('ended', 'dashboard.quicklook.date.ended', $lastEpisode);
+        }
+        return $chips;
+    }
+
+    private function parseDate(?string $raw): ?\DateTimeImmutable
+    {
+        return ($raw !== null && $raw !== '') ? new \DateTimeImmutable($raw) : null;
+    }
+
+    /**
      * Return the earliest release date that is today or later for a Radarr
      * movie, together with a human-readable badge identifying which date
      * it is (digital / cinema / physical). The comparison is done at
@@ -742,6 +827,9 @@ class DashboardController extends AbstractController
         $badgeKind = $hasFile ? 'downloaded' : ($monitored ? 'monitored' : 'missing');
         $badgeKey  = 'dashboard.quicklook.status.' . $badgeKind;
 
+        $ended     = ($row['ended'] ?? false) === true || ($row['status'] ?? '') === 'ended';
+        $airStatus = $type === 'series' ? ($ended ? 'ended' : 'continuing') : null;
+
         if ($type === 'series') {
             $metaLine  = $row['network'] ?? null;
             $actionUrl = $this->generateUrl('app_media_series', ['slug' => $slug]) . '?open=' . $id;
@@ -752,17 +840,33 @@ class DashboardController extends AbstractController
         }
 
         return [
-            'title'       => $row['title'] ?? '—',
-            'year'        => $row['year'] ?? null,
-            'poster'      => $row['poster'] ?? null,
-            'backdrop'    => $row['fanart'] ?? null,
-            'overview'    => $row['overview'] ?? null,
-            'genres'      => array_slice($row['genres'] ?? [], 0, 4),
-            'rating'      => $row['ratings'] ?? null,
-            'metaLine'    => $metaLine,
-            'statusBadge' => ['label' => $this->translator->trans($badgeKey), 'kind' => $badgeKind],
-            'actionUrl'   => $actionUrl,
-            'actionLabel' => $this->translator->trans('dashboard.quicklook.manage'),
+            'title'        => $row['title'] ?? '—',
+            'year'         => $row['year'] ?? null,
+            'poster'       => $row['poster'] ?? null,
+            'backdrop'     => $row['fanart'] ?? null,
+            'overview'     => $row['overview'] ?? null,
+            'genres'       => array_slice($row['genres'] ?? [], 0, 4),
+            'rating'       => $row['ratings'] ?? null,
+            'metaLine'     => $metaLine,
+            'statusBadge'  => ['label' => $this->translator->trans($badgeKey), 'kind' => $badgeKind],
+            'actionUrl'    => $actionUrl,
+            'actionLabel'  => $this->translator->trans('dashboard.quicklook.manage'),
+            'inLibrary'    => true,
+            'airStatus'    => $airStatus,
+            'releaseDates' => $type === 'series'
+                ? $this->seriesReleaseChips(
+                    $row['firstAired'] ?? null,
+                    $row['nextAiring'] ?? null,
+                    $row['previousAiring'] ?? null,
+                    $ended,
+                    new \DateTimeImmutable('today'),
+                )
+                : $this->movieReleaseChips(
+                    $row['inCinemasAt'] ?? null,
+                    $row['digitalAt'] ?? null,
+                    $row['physicalAt'] ?? null,
+                    new \DateTimeImmutable('today'),
+                ),
         ];
     }
 
@@ -806,18 +910,192 @@ class DashboardController extends AbstractController
             $metaLine = $runtime ? $this->translator->trans('dashboard.quicklook.runtime', ['min' => $runtime]) : null;
         }
 
+        $ended     = $isTv && in_array($data['status'] ?? '', ['Ended', 'Canceled'], true);
+        $airStatus = $isTv ? ($ended ? 'ended' : 'continuing') : null;
+
+        $extras = $this->quickLookExtras($data);
+
+        // Unify the action model with the old Explorer modal: a title already
+        // in a Radarr/Sonarr library deep-links to Manage (exact instance);
+        // otherwise the body renders an Add affordance. Reuses the cached
+        // library aggregates — no extra upstream calls.
+        $match = $this->quickLookLibraryMatch($type, $id);
+        if ($match !== null) {
+            $statusBadge = [
+                'label' => $this->translator->trans('dashboard.quicklook.status.' . $match['status']),
+                'kind'  => $match['status'],
+            ];
+            $actionUrl   = $isTv
+                ? $this->generateUrl('app_media_series', ['slug' => $match['slug']]) . '?open=' . $match['id']
+                : $this->generateUrl('app_media_films', ['slug' => $match['slug']]) . '?open=' . $match['id'];
+            $actionLabel = $this->translator->trans('dashboard.quicklook.manage');
+        } else {
+            $statusBadge = null;
+            $actionUrl   = $this->generateUrl('tmdb_index') . '?detail=' . $type . '/' . $id;
+            $actionLabel = $this->translator->trans('dashboard.quicklook.discover');
+        }
+
         return [
-            'title'       => $data['title'] ?? $data['name'] ?? '—',
-            'year'        => $year,
-            'poster'      => $this->tmdbImage($data['poster_path'] ?? null, 'w342'),
-            'backdrop'    => $this->tmdbImage($data['backdrop_path'] ?? null, 'w1280'),
-            'overview'    => $data['overview'] ?? null,
-            'genres'      => array_slice(array_map(fn($g) => $g['name'] ?? '', $data['genres'] ?? []), 0, 4),
-            'rating'      => $data['vote_average'] ?? null,
-            'metaLine'    => $metaLine,
-            'statusBadge' => null,
-            'actionUrl'   => $this->generateUrl('tmdb_index') . '?detail=' . $type . '/' . $id,
-            'actionLabel' => $this->translator->trans('dashboard.quicklook.discover'),
+            'title'        => $data['title'] ?? $data['name'] ?? '—',
+            'year'         => $year,
+            'poster'       => $this->tmdbImage($data['poster_path'] ?? null, 'w342'),
+            'posterPath'   => $data['poster_path'] ?? null,
+            'backdrop'     => $this->tmdbImage($data['backdrop_path'] ?? null, 'w1280'),
+            'overview'     => $data['overview'] ?? null,
+            'genres'       => array_slice(array_map(fn($g) => $g['name'] ?? '', $data['genres'] ?? []), 0, 4),
+            'rating'       => $data['vote_average'] ?? null,
+            'metaLine'     => $metaLine,
+            'statusBadge'  => $statusBadge,
+            'actionUrl'    => $actionUrl,
+            'actionLabel'  => $actionLabel,
+            'inLibrary'    => $match !== null,
+            'airStatus'    => $airStatus,
+            'cast'         => $extras['cast'],
+            'providers'    => $extras['providers'],
+            'trailerKey'   => $extras['trailerKey'],
+            'imdbId'       => $extras['imdbId'],
+            'tmdbId'       => $id,
+            'tmdbType'     => $type,
+            'releaseDates' => $isTv
+                ? $this->seriesReleaseChips(
+                    $this->parseDate($data['first_air_date'] ?? null),
+                    $this->parseDate($data['next_episode_to_air']['air_date'] ?? null),
+                    $this->parseDate($data['last_episode_to_air']['air_date'] ?? null),
+                    $ended,
+                    new \DateTimeImmutable('today'),
+                )
+                : $this->tmdbMovieReleaseDates(
+                    $data['release_dates']['results'] ?? [],
+                    new \DateTimeImmutable('today'),
+                ),
+        ];
+    }
+
+    /**
+     * Locate a TMDb id within the aggregated Radarr/Sonarr libraries so the
+     * quick-look can deep-link to Manage (and badge the status) for titles
+     * already added, and show an Add affordance otherwise. Reuses the
+     * per-request cached movies()/series() aggregates — no extra upstream
+     * calls. $type is the TMDb media type ('movie'|'tv').
+     *
+     * @return array{slug: string, id: int, status: string}|null
+     */
+    private function quickLookLibraryMatch(string $type, int $tmdbId): ?array
+    {
+        // Fail open: if the library can't be read (service down / not
+        // configured), treat the title as not-in-library so the modal still
+        // offers Add rather than erroring — same philosophy as the widgets.
+        try {
+            $rows = $type === 'movie' ? $this->movies() : $this->series();
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if ($type === 'movie') {
+            foreach ($rows as $m) {
+                if ((int) ($m['tmdbId'] ?? 0) !== $tmdbId) {
+                    continue;
+                }
+                $slug = $m['_instanceSlug'] ?? null;
+                if ($slug === null) {
+                    continue;
+                }
+                $status = ($m['hasFile'] ?? false) === true
+                    ? 'downloaded'
+                    : (($m['monitored'] ?? false) === true ? 'monitored' : 'missing');
+                return ['slug' => $slug, 'id' => (int) ($m['id'] ?? 0), 'status' => $status];
+            }
+            return null;
+        }
+
+        foreach ($rows as $s) {
+            if ((int) ($s['tmdbId'] ?? 0) !== $tmdbId) {
+                continue;
+            }
+            $slug = $s['_instanceSlug'] ?? null;
+            if ($slug === null) {
+                continue;
+            }
+            $status = ($s['monitored'] ?? false) === true ? 'monitored' : 'missing';
+            return ['slug' => $slug, 'id' => (int) ($s['id'] ?? 0), 'status' => $status];
+        }
+        return null;
+    }
+
+    /**
+     * Extract the richer detail bits (cast, streaming providers, trailer, IMDb
+     * id) from a TMDb detail payload. TmdbClient::getMovie/getTv already pull
+     * credits/videos/watch-providers/external_ids via append_to_response, so
+     * this is pure extraction — no extra API call.
+     *
+     * @param array<string, mixed> $data
+     * @return array{cast: list<array{name: string, profile: ?string}>, providers: list<array{name: string, logo: ?string}>, trailerKey: ?string, imdbId: ?string}
+     */
+    private function quickLookExtras(array $data): array
+    {
+        $cast = [];
+        foreach (array_slice($data['credits']['cast'] ?? [], 0, 6) as $c) {
+            $cast[] = [
+                'name'    => $c['name'] ?? '',
+                'profile' => TmdbClient::posterUrl($c['profile_path'] ?? null, 'w185'),
+            ];
+        }
+
+        // Streaming (flatrate) providers, FR-first then common fallbacks —
+        // mirrors TmdbController::pickProviders' country priority.
+        $providers = [];
+        foreach (['FR', 'BE', 'LU', 'US', 'GB'] as $cc) {
+            $flat = $data['watch/providers']['results'][$cc]['flatrate'] ?? [];
+            if ($flat === []) {
+                continue;
+            }
+            foreach ($flat as $p) {
+                $providers[] = [
+                    'name' => $p['provider_name'] ?? '',
+                    'logo' => TmdbClient::posterUrl($p['logo_path'] ?? null, 'w92'),
+                ];
+            }
+            break;
+        }
+
+        // Best YouTube trailer/teaser — official + EN/FR preferred, mirrors
+        // TmdbController::pickTrailer's scoring (trimmed for the modal).
+        $trailerKey = null;
+        $videos = array_filter(
+            $data['videos']['results'] ?? [],
+            static fn($v) => ($v['site'] ?? '') === 'YouTube',
+        );
+        $score = static function (array $v): int {
+            $s = 0;
+            if (($v['type'] ?? '') === 'Trailer') {
+                $s += 100;
+            } elseif (($v['type'] ?? '') === 'Teaser') {
+                $s += 50;
+            }
+            if (($v['official'] ?? false) === true) {
+                $s += 40;
+            }
+            $lang = strtolower($v['iso_639_1'] ?? '');
+            if ($lang === 'en') {
+                $s += 20;
+            } elseif ($lang === 'fr') {
+                $s += 15;
+            }
+            return $s;
+        };
+        usort($videos, static fn($a, $b) => $score($b) <=> $score($a));
+        $first = reset($videos);
+        if ($first) {
+            $trailerKey = $first['key'] ?? null;
+        }
+
+        $imdbId = $data['imdb_id'] ?? ($data['external_ids']['imdb_id'] ?? null);
+
+        return [
+            'cast'       => $cast,
+            'providers'  => $providers,
+            'trailerKey' => $trailerKey,
+            'imdbId'     => $imdbId,
         ];
     }
 
